@@ -2,7 +2,7 @@
 
 DeepShield is a web platform for detecting deepfake and AI-generated images/videos, built as a deepfake-reporting workflow demo modeled loosely on a government cyber-crime reporting pipeline. It combines real AI detection (via Sightengine) with a tamper-evident evidence chain, case management, and an escalation flow.
 
-**Live demo:** [code-her.vercel.app](https://code-her.vercel.app)
+**Live demo:** [deep-shieldx.vercel.app](https://deep-shieldx.vercel.app)
 
 ---
 
