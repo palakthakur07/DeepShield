@@ -8,6 +8,8 @@
 //   5. casesDB is now backed by an external store — see note at bottom
 // ================================================
 
+
+
 require('dotenv').config();
 const express  = require('express');
 const cors     = require('cors');
@@ -15,6 +17,7 @@ const multer   = require('multer');
 const axios    = require('axios');
 const FormData = require('form-data');
 const crypto   = require('crypto');
+const { kv } = require('@vercel/kv');
 
 const app = express();
 
@@ -42,17 +45,26 @@ const upload = multer({
 // single warm invocation chain during testing, then silently reset.
 // Swap getCases/saveCase below for a real external store before relying
 // on this for real cases. See note at bottom of file for options.
-let casesDB = [];
+const CASES_KEY = 'deepshield:cases';
 
 async function getCases() {
-  return casesDB;
+  const cases = await kv.get(CASES_KEY);
+  return cases || [];
 }
+
 async function saveCase(record) {
-  casesDB.push(record);
+  const cases = await getCases();
+  cases.push(record);
+  await kv.set(CASES_KEY, cases);
 }
+
 async function updateCase(caseId, mutateFn) {
-  const record = casesDB.find(c => c.caseId === caseId);
-  if (record) mutateFn(record);
+  const cases = await getCases();
+  const record = cases.find(c => c.caseId === caseId);
+  if (record) {
+    mutateFn(record);
+    await kv.set(CASES_KEY, cases);
+  }
   return record;
 }
 
@@ -92,7 +104,7 @@ function appendChain(chain, caseId, hash, confidence, action) {
 async function detectWithAI(buffer, mimetype, originalname) {
   const form = new FormData();
   form.append('media', buffer, { filename: originalname || 'upload' });
-  form.append('models',  'deepfake');
+  form.append('models', 'deepfake,genai');
   form.append('api_user',   SE_USER);
   form.append('api_secret', SE_SECRET);
 
@@ -106,29 +118,32 @@ async function detectWithAI(buffer, mimetype, originalname) {
   });
 
   const data = resp.data;
+  console.log('Sightengine raw response:', JSON.stringify(data));
 
-  let score = 0;
-  if (data.type && data.type.deepfake !== undefined) {
-    score = data.type.deepfake;
-  } else if (data.summary && data.summary.action) {
-    score = data.summary.reject_rate || 0;
-  } else if (data.deepfake !== undefined) {
-    score = data.deepfake;
+  if (data.status === 'failure') {
+    throw new Error('Sightengine error: ' + (data.error?.message || 'unknown'));
   }
 
-  const isDeepfake = score >= 0.5;
+  const deepfakeScore = data.type?.deepfake ?? 0;
+  const aiGenScore    = data.type?.ai_generated ?? 0;
+
+  const topScore = Math.max(deepfakeScore, aiGenScore);
+  const isDeepfake = topScore >= 0.5;
+  const detectionType = topScore < 0.5
+    ? 'authentic'
+    : (deepfakeScore >= aiGenScore ? 'deepfake' : 'ai_generated');
+
   const confidence = isDeepfake
-    ? Math.round(score * 100)
-    : Math.round((1 - score) * 100);
+    ? Math.round(topScore * 100)
+    : Math.round((1 - topScore) * 100);
 
   let severity = 'low';
-  if (score >= 0.85) severity = 'critical';
-  else if (score >= 0.70) severity = 'high';
-  else if (score >= 0.50) severity = 'medium';
+  if (topScore >= 0.85) severity = 'critical';
+  else if (topScore >= 0.70) severity = 'high';
+  else if (topScore >= 0.50) severity = 'medium';
 
-  return { isDeepfake, confidence, score, severity, raw: data };
+  return { isDeepfake, detectionType, confidence, deepfakeScore, aiGenScore, severity, raw: data };
 }
-
 // ─────────────────────────────────────────────────
 // POST /api/detect
 // ─────────────────────────────────────────────────
@@ -148,10 +163,12 @@ app.post('/api/detect', upload.single('file'), async (req, res) => {
       fileType:   req.file.mimetype,
       fileSize:   req.file.size,
       mediaHash:  hash,
-      isDeepfake: ai.isDeepfake,
-      confidence: ai.confidence,
-      score:      parseFloat(ai.score.toFixed(4)),
-      severity:   ai.severity,
+      isDeepfake:    ai.isDeepfake,
+      detectionType: ai.detectionType,
+      confidence:    ai.confidence,
+      deepfakeScore: parseFloat(ai.deepfakeScore.toFixed(4)),
+      aiGenScore:    parseFloat(ai.aiGenScore.toFixed(4)),
+      severity:      ai.severity,
       status:     'pending',
       govtRef:    null,
       location:   req.body.location || null,
@@ -164,17 +181,26 @@ app.post('/api/detect', upload.single('file'), async (req, res) => {
 
     await saveCase(record);
 
-    res.json({
-      success:    true,
-      caseId:     record.caseId,
-      isDeepfake: record.isDeepfake,
-      confidence: record.confidence,
-      severity:   record.severity,
-      verdict:    record.isDeepfake ? 'DEEPFAKE DETECTED' : 'AUTHENTIC MEDIA',
-      mediaHash:  record.mediaHash,
-      status:     record.status,
-      model:      'Sightengine Deepfake AI'
-    });
+    const verdictMap = {
+  deepfake:     'DEEPFAKE DETECTED',
+  ai_generated: 'AI GENERATED IMAGE DETECTED',
+  authentic:    'AUTHENTIC MEDIA'
+};
+
+res.json({
+  success:       true,
+  caseId:        record.caseId,
+  isDeepfake:    record.isDeepfake,
+  detectionType: record.detectionType,
+  confidence:    record.confidence,
+  deepfakeScore: record.deepfakeScore,
+  aiGenScore:    record.aiGenScore,
+  severity:      record.severity,
+  verdict:       verdictMap[record.detectionType],
+  mediaHash:     record.mediaHash,
+  status:        record.status,
+  model:         'Sightengine Deepfake + GenAI'
+});
 
   } catch (err) {
     console.error('Detection error:', err.message);
@@ -229,17 +255,20 @@ app.post('/api/escalate', async (req, res) => {
 app.get('/api/cases', async (req, res) => {
   const cases = await getCases();
   const sanitized = cases.map(c => ({
-    caseId:     c.caseId,
-    isDeepfake: c.isDeepfake,
-    confidence: c.confidence,
-    severity:   c.severity,
-    status:     c.status,
-    location:   c.location,
-    govtRef:    c.govtRef,
-    maskedUid:  c.maskedUid,
-    timestamp:  c.timestamp,
-    fileName:   c.fileName
-  }));
+  caseId:        c.caseId,
+  isDeepfake:    c.isDeepfake,
+  detectionType: c.detectionType,
+  confidence:    c.confidence,
+  deepfakeScore: c.deepfakeScore,
+  aiGenScore:    c.aiGenScore,
+  severity:      c.severity,
+  status:        c.status,
+  location:      c.location,
+  govtRef:       c.govtRef,
+  maskedUid:     c.maskedUid,
+  timestamp:     c.timestamp,
+  fileName:      c.fileName
+}));
   res.json({ success: true, total: cases.length, cases: sanitized });
 });
 
