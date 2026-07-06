@@ -8,7 +8,15 @@
 //   5. casesDB is now backed by an external store — see note at bottom
 // ================================================
 
-
+app.get('/api/kv-test', async (req, res) => {
+  try {
+    await kv.set('test-key', 'hello-' + Date.now());
+    const value = await kv.get('test-key');
+    res.json({ success: true, connected: true, value });
+  } catch (err) {
+    res.json({ success: false, connected: false, error: err.message });
+  }
+});
 
 require('dotenv').config();
 const express  = require('express');
